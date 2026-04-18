@@ -2,91 +2,92 @@ import cv2
 import numpy as np
 import subprocess
 import os
+import shutil
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 
-def compress_base_layer(input_video_path, output_video_path, bitrate=100):  # 100 kbps
-    # Temporary raw video for processing
+# Quantization matrix for base layer
+QUANTIZATION_MATRIX = np.ones((8, 8), dtype=np.float32) * 16
+
+def process_frame(frame):
+    """Process a single frame with DCT quantization."""
+    frame_yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV).astype(np.float32)
+
+    for channel in range(3):
+        y_channel = frame_yuv[:, :, channel]
+        height, width = y_channel.shape
+
+        pad_h = (8 - height % 8) % 8
+        pad_w = (8 - width % 8) % 8
+        if pad_h or pad_w:
+            y_channel = np.pad(y_channel, ((0, pad_h), (0, pad_w)), mode='edge')
+
+        ph, pw = y_channel.shape
+        for i in range(0, ph, 8):
+            for j in range(0, pw, 8):
+                block = y_channel[i:i+8, j:j+8]
+                dct_block = cv2.dct(block)
+                quantized = np.round(dct_block / QUANTIZATION_MATRIX)
+                y_channel[i:i+8, j:j+8] = cv2.idct(quantized * QUANTIZATION_MATRIX)
+
+        frame_yuv[:, :, channel] = np.clip(y_channel[:height, :width], 0, 255)
+
+    return cv2.cvtColor(frame_yuv.astype(np.uint8), cv2.COLOR_YUV2BGR)
+
+def compress_base_layer(input_video_path, output_video_path, bitrate=100):
     temp_raw = "temp_raw.avi"
-    
-    # Open input video
+
     cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video at {input_video_path}")
         return
 
-    # Get video properties
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = int(cap.get(cv2.CAP_PROP_FPS))
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Temporary codec #type:ignore
-
-    # Initialize temporary video writer
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
     out = cv2.VideoWriter(temp_raw, fourcc, fps, (frame_width, frame_height))
 
-    # Quantization matrix for base layer
-    quantization_matrix = np.ones((8, 8), dtype=np.float32) * 16
-
-    print("Starting frame processing...")
-    frame_count = 0
+    print("Reading frames...")
+    frames = []
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-
-        # Convert to YUV
-        frame_yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
-
-        # Process all channels (Y, U, V)
-        for channel in range(3):  # 0: Y, 1: U, 2: V
-            y_channel = frame_yuv[:, :, channel].astype(np.float32)
-
-            # Apply DCT and quantization to 8x8 blocks
-            height, width = y_channel.shape
-            for i in range(0, height, 8):
-                for j in range(0, width, 8):
-                    block = y_channel[i:i+8, j:j+8]
-                    if block.shape == (8, 8):
-                        dct_block = cv2.dct(block)
-                        quantized_block = np.round(dct_block / quantization_matrix)
-                        idct_block = cv2.idct(quantized_block * quantization_matrix)
-                        y_channel[i:i+8, j:j+8] = idct_block
-
-            # Update the channel in the YUV frame
-            frame_yuv[:, :, channel] = y_channel.astype(np.uint8)
-
-        # Reconstruct frame
-        reconstructed_frame = cv2.cvtColor(frame_yuv, cv2.COLOR_YUV2BGR)
-        out.write(reconstructed_frame)
-        frame_count += 1
-        if frame_count % 100 == 0:
-            print(f"Processed {frame_count} frames...")
-
+        frames.append(frame)
     cap.release()
-    out.release()
-    print(f"Finished processing {frame_count} frames. Converting to MP4...")
 
-    # Use FFmpeg to compress with specified bitrate
-    import shutil
+    print(f"Processing {len(frames)} frames with {os.cpu_count()} threads...")
+    processed = []
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        for result in tqdm(executor.map(process_frame, frames), total=len(frames), desc="Base Layer"):
+            processed.append(result)
+
+    for frame in processed:
+        out.write(frame)
+    out.release()
+
+    print(f"Finished processing {len(processed)} frames. Converting to MP4...")
+
     ffmpeg_path = shutil.which('ffmpeg') or r'C:\ffmpeg\bin\ffmpeg.exe'
     cmd = [
-        ffmpeg_path, '-i', temp_raw, '-b:v', f'{bitrate}k', '-c:v', 'libx264',
+        ffmpeg_path, '-i', temp_raw,
+        '-b:v', f'{bitrate}k', '-c:v', 'libx264',
         '-preset', 'medium', '-y', output_video_path
     ]
     try:
-        result = subprocess.run(cmd, check=True, stderr=subprocess.PIPE, text=True)
-        print("FFmpeg output:", result.stderr)
+        subprocess.run(cmd, check=True, stderr=subprocess.PIPE, text=True)
+        print("FFmpeg conversion complete.")
     except subprocess.CalledProcessError as e:
         print(f"FFmpeg error: {e.stderr}")
         return
     except FileNotFoundError:
-        print("Error: FFmpeg not found. Please install FFmpeg and add it to your PATH.")
+        print("Error: FFmpeg not found.")
         return
 
-    # Remove temporary file
     if os.path.exists(temp_raw):
         os.remove(temp_raw)
-    print(f"Base layer compressed video saved as {output_video_path}")
+    print(f"Base layer saved as {output_video_path}")
 
 if __name__ == "__main__":
-    input_video = "input/input_video.mp4"
-    output_video = "output/base_layer.mp4"
-    compress_base_layer(input_video, output_video)
+    compress_base_layer("input/input_video.mp4", "output/base_layer.mp4")
